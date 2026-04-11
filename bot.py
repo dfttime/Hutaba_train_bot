@@ -1189,12 +1189,12 @@ def main():
     async def get_db(update, context):
         await update.message.reply_document(open("workouts.db", "rb"))
 
+    app.add_handler(conv)  # conv ПЕРВЫМ, до всего остального
     app.add_handler(CommandHandler("getdb", get_db))
-    app.add_handler(conv)
     app.add_handler(CommandHandler("history", history_command))
 
     print("🤖 Бот запущен! Ctrl+C для остановки.")
-    app.run_polling(drop_pending_updates=True)  # только один раз, в самом конце!
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
