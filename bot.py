@@ -532,14 +532,19 @@ async def save_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     user_id      = q.from_user.id
-    workout_type = context.user_data["workout_type"]
-    results      = context.user_data["results"]
+    workout_type = context.user_data.get("workout_type")
+    results      = context.user_data.get("results", [])
     notes        = context.user_data.get("notes", "")
+
+    if not workout_type or not results:
+        await q.message.reply_text("⚠️ Нет данных для сохранения. Начни тренировку заново: /start")
+        return ConversationHandler.END
 
     db.save_workout_session(user_id, workout_type, results, notes=notes)
 
     total_sets = sum(len(r["sets_data"]) for r in results)
-    total_reps = sum(r for ex in results for _, r in ex["sets_data"])
+    # Защита: пропускаем упражнения без данных
+    total_reps = sum(r for ex in results for _, r in ex.get("sets_data", []))
     vol        = session_volume(results)
     streak     = db.get_streak(user_id)
 
