@@ -1183,6 +1183,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
+        per_message=False,
     )
 
     async def get_db(update, context):
