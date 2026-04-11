@@ -1,5 +1,5 @@
 """
-database.py — SQLite-слой для Workout Tracker Bot
+database.py — SQLite-слой для Workout Tracker Bot v2.0
 """
 import sqlite3
 import json
@@ -12,40 +12,41 @@ class Database:
         self.db_path = db_path
         self._init_db()
 
-    # ─── Подключение ──────────────────────────────────────────────────────────
-
     def _conn(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
-    # ─── Схема ────────────────────────────────────────────────────────────────
-
     def _init_db(self):
         with self._conn() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id   INTEGER PRIMARY KEY,
-                    created_at TEXT DEFAULT (datetime('now')),
-                    remind_hour INTEGER DEFAULT NULL,
-                    remind_days TEXT DEFAULT NULL
+                    user_id    INTEGER PRIMARY KEY,
+                    created_at TEXT DEFAULT (datetime('now'))
                 );
 
-                -- Каждая завершённая тренировка
+                CREATE TABLE IF NOT EXISTS profiles (
+                    user_id INTEGER PRIMARY KEY,
+                    name    TEXT NOT NULL DEFAULT '',
+                    weight  REAL,
+                    height  INTEGER,
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS workout_sessions (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id      INTEGER NOT NULL,
-                    workout_type TEXT NOT NULL,
-                    date         TEXT NOT NULL DEFAULT (datetime('now')),
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id        INTEGER NOT NULL,
+                    workout_type   TEXT NOT NULL,
+                    date           TEXT NOT NULL DEFAULT (datetime('now')),
                     exercises_json TEXT NOT NULL,
-                    notes        TEXT DEFAULT '',
+                    notes          TEXT DEFAULT '',
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_ws_user_date
                     ON workout_sessions(user_id, date DESC);
 
-                -- Кастомные упражнения, добавленные пользователем
                 CREATE TABLE IF NOT EXISTS custom_exercises (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id      INTEGER NOT NULL,
@@ -56,7 +57,6 @@ class Database:
                     UNIQUE(user_id, workout_type, name)
                 );
 
-                -- Базовые упражнения, которые пользователь скрыл
                 CREATE TABLE IF NOT EXISTS removed_exercises (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id      INTEGER NOT NULL,
@@ -72,24 +72,39 @@ class Database:
         with self._conn() as conn:
             conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
 
-    def set_reminder(self, user_id: int, hour: Optional[int], days: Optional[list]):
+    # ─── Профиль ──────────────────────────────────────────────────────────────
+
+    def save_profile(self, user_id: int, name: str, weight: float, height: int):
+        self.ensure_user(user_id)
         with self._conn() as conn:
             conn.execute(
-                "UPDATE users SET remind_hour=?, remind_days=? WHERE user_id=?",
-                (hour, json.dumps(days) if days else None, user_id)
+                "INSERT OR REPLACE INTO profiles(user_id, name, weight, height, updated_at)"
+                " VALUES(?, ?, ?, ?, datetime('now'))",
+                (user_id, name, weight, height)
             )
 
-    def get_reminder(self, user_id: int) -> dict:
+    def get_profile(self, user_id: int) -> Optional[dict]:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT remind_hour, remind_days FROM users WHERE user_id=?", (user_id,)
+                "SELECT name, weight, height FROM profiles WHERE user_id=?", (user_id,)
             ).fetchone()
             if not row:
-                return {}
-            return {
-                "hour": row["remind_hour"],
-                "days": json.loads(row["remind_days"]) if row["remind_days"] else None,
-            }
+                return None
+            return {"name": row["name"], "weight": row["weight"], "height": row["height"]}
+
+    def update_profile_weight(self, user_id: int, weight: float):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE profiles SET weight=?, updated_at=datetime('now') WHERE user_id=?",
+                (weight, user_id)
+            )
+
+    def update_profile_height(self, user_id: int, height: int):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE profiles SET height=?, updated_at=datetime('now') WHERE user_id=?",
+                (height, user_id)
+            )
 
     # ─── Сохранение тренировки ────────────────────────────────────────────────
 
@@ -97,6 +112,7 @@ class Database:
         self, user_id: int, workout_type: str, exercises: list,
         notes: str = "", date_override: Optional[str] = None
     ) -> int:
+        self.ensure_user(user_id)
         serializable = []
         for ex in exercises:
             e = dict(ex)
@@ -137,15 +153,6 @@ class Database:
             "notes":        row["notes"] or "",
         }
 
-    def get_last_workout(self, user_id: int) -> Optional[dict]:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT id,workout_type,date,exercises_json,notes FROM workout_sessions"
-                " WHERE user_id=? ORDER BY date DESC LIMIT 1",
-                (user_id,)
-            ).fetchone()
-            return self._deserialize_session(row) if row else None
-
     def get_last_n_workouts(self, user_id: int, n: int = 2) -> list:
         with self._conn() as conn:
             rows = conn.execute(
@@ -155,7 +162,8 @@ class Database:
             ).fetchall()
             return [self._deserialize_session(r) for r in rows]
 
-    def get_history(self, user_id: int, limit: int = 10, workout_type: Optional[str] = None) -> list:
+    def get_history(self, user_id: int, limit: int = 10,
+                    workout_type: Optional[str] = None) -> list:
         with self._conn() as conn:
             if workout_type:
                 rows = conn.execute(
@@ -196,16 +204,9 @@ class Database:
                         return ex
         return None
 
-    def count_sessions(self, user_id: int) -> int:
-        with self._conn() as conn:
-            return conn.execute(
-                "SELECT COUNT(*) FROM workout_sessions WHERE user_id=?", (user_id,)
-            ).fetchone()[0]
-
     # ─── Статистика ───────────────────────────────────────────────────────────
 
     def get_exercise_history(self, user_id: int, ex_name: str, limit: int = 10) -> list:
-        """Возвращает список (date, sets_data) для конкретного упражнения."""
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT date, exercises_json FROM workout_sessions"
@@ -225,23 +226,21 @@ class Database:
         return results
 
     def get_personal_record(self, user_id: int, ex_name: str) -> Optional[dict]:
-        """Максимальный вес когда-либо в данном упражнении."""
-        history = self.get_exercise_history(user_id, ex_name, limit=100)
-        best_weight = None
-        best_date = None
+        history      = self.get_exercise_history(user_id, ex_name, limit=100)
+        best_weight  = None
+        best_date    = None
         for entry in history:
             for w, r in entry["sets_data"]:
                 if isinstance(w, (int, float)) and (best_weight is None or w > best_weight):
                     best_weight = w
-                    best_date = entry["date"]
+                    best_date   = entry["date"]
         if best_weight is None:
             return None
         return {"weight": best_weight, "date": best_date}
 
     def get_volume_per_session(self, user_id: int, limit: int = 20) -> list:
-        """Объём (кг×повт) по каждой тренировке."""
         sessions = self.get_history(user_id, limit=limit)
-        result = []
+        result   = []
         for s in sessions:
             vol = 0
             for ex in s["exercises"]:
@@ -252,7 +251,6 @@ class Database:
         return result
 
     def compare_sessions(self, user_id: int, sid1: int, sid2: int) -> Optional[dict]:
-        """Сравнивает две тренировки по id."""
         s1 = self.get_session_by_id(user_id, sid1)
         s2 = self.get_session_by_id(user_id, sid2)
         if not s1 or not s2:
@@ -260,7 +258,6 @@ class Database:
         return {"s1": s1, "s2": s2}
 
     def get_streak(self, user_id: int) -> dict:
-        """Серия тренировок: текущая и максимальная."""
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT date FROM workout_sessions WHERE user_id=? ORDER BY date DESC",
@@ -271,20 +268,18 @@ class Database:
 
         dates = sorted(
             set(datetime.fromisoformat(r["date"]).date() for r in rows),
-            reverse=True
+            reverse=True,
         )
         total = len(dates)
 
-        # Текущая серия
         current = 1
         for i in range(1, len(dates)):
-            if (dates[i - 1] - dates[i]).days <= 2:   # даём 1 день отдыха
+            if (dates[i - 1] - dates[i]).days <= 2:
                 current += 1
             else:
                 break
 
-        # Максимальная серия
-        best = 1
+        best   = 1
         streak = 1
         for i in range(1, len(dates)):
             if (dates[i - 1] - dates[i]).days <= 2:
@@ -296,12 +291,11 @@ class Database:
         return {"current": current, "best": best, "total": total}
 
     def get_weekly_summary(self, user_id: int, weeks: int = 4) -> list:
-        """Количество тренировок по неделям за последние N недель."""
-        now = datetime.now()
+        now    = datetime.now()
         result = []
         for w in range(weeks - 1, -1, -1):
             start = (now - timedelta(weeks=w + 1)).date()
-            end = (now - timedelta(weeks=w)).date()
+            end   = (now - timedelta(weeks=w)).date()
             with self._conn() as conn:
                 count = conn.execute(
                     "SELECT COUNT(*) FROM workout_sessions"
@@ -314,7 +308,8 @@ class Database:
 
     # ─── Кастомные упражнения ─────────────────────────────────────────────────
 
-    def add_custom_exercise(self, user_id: int, workout_type: str, name: str, sets: int, reps: str):
+    def add_custom_exercise(self, user_id: int, workout_type: str,
+                            name: str, sets: int, reps: str):
         with self._conn() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO custom_exercises(user_id,workout_type,name,sets,reps)"
@@ -329,7 +324,8 @@ class Database:
     def get_custom_exercises(self, user_id: int, workout_type: str) -> list:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT name,sets,reps FROM custom_exercises WHERE user_id=? AND workout_type=?",
+                "SELECT name,sets,reps FROM custom_exercises"
+                " WHERE user_id=? AND workout_type=?",
                 (user_id, workout_type)
             ).fetchall()
             return [{"name": r["name"], "sets": r["sets"], "reps": r["reps"]} for r in rows]
@@ -337,7 +333,8 @@ class Database:
     def remove_exercise(self, user_id: int, workout_type: str, name: str):
         with self._conn() as conn:
             conn.execute(
-                "INSERT OR IGNORE INTO removed_exercises(user_id,workout_type,name) VALUES(?,?,?)",
+                "INSERT OR IGNORE INTO removed_exercises(user_id,workout_type,name)"
+                " VALUES(?,?,?)",
                 (user_id, workout_type, name)
             )
 

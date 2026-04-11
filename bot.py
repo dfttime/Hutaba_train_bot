@@ -1,6 +1,7 @@
 """
-Workout Tracker Bot — полная версия
-Команды: /start /history /stats /compare /records /cancel
+Workout Tracker Bot — v2.0
+Команды: /start /cancel
+Полностью кнопочное управление, регистрация, профиль пользователя.
 """
 import logging
 import os
@@ -13,10 +14,8 @@ from telegram.ext import (
 )
 from database import Database
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -24,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Состояния разговора ──────────────────────────────────────────────────────
+# ─── Состояния ────────────────────────────────────────────────────────────────
 (
     MAIN_MENU,
     CHOOSE_WORKOUT,
@@ -38,7 +37,13 @@ logger = logging.getLogger(__name__)
     COMPARE_PICK_SECOND,
     STATS_EXERCISE,
     ADD_NOTE,
-) = range(12)
+    # Регистрация / профиль
+    REG_NAME,
+    REG_WEIGHT,
+    REG_HEIGHT,
+    PROFILE_EDIT_WEIGHT,
+    PROFILE_EDIT_HEIGHT,
+) = range(17)
 
 db = Database("workouts.db")
 
@@ -73,22 +78,15 @@ WORKOUTS = {
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
 def get_exercises(user_id: int, workout_type: str) -> list:
-    base = [ex.copy() for ex in WORKOUTS[workout_type]["exercises"]]
+    base    = [ex.copy() for ex in WORKOUTS[workout_type]["exercises"]]
     removed = db.get_removed_exercises(user_id, workout_type)
-    custom = db.get_custom_exercises(user_id, workout_type)
-    result = [ex for ex in base if ex["name"] not in removed]
+    custom  = db.get_custom_exercises(user_id, workout_type)
+    result  = [ex for ex in base if ex["name"] not in removed]
     result.extend(custom)
     return result
 
 
 def parse_set_input(text: str):
-    """
-    Парсит ввод одного подхода.
-    "60 10" / "60кг 10" / "60x10" → (60, 10)
-    "10"                           → (None, 10)  — вес из контекста
-    "без веса 15" / "б/в 15"       → ("б/в", 15)
-    Возвращает (weight, reps) или None.
-    """
     t = text.strip().lower()
     no_w = re.match(r"(без\s*веса|б/?в|bodyweight|bw)[^\d]*(\d+)", t)
     if no_w:
@@ -124,13 +122,10 @@ def session_volume(exercises: list) -> float:
     return vol
 
 
-def session_label(session: dict) -> str:
-    dt = datetime.fromisoformat(session["date"]).strftime("%d.%m.%Y %H:%M")
-    return f"Тренировка {session['workout_type']} — {dt}"
-
-
 def build_bar(current: int, total: int) -> str:
-    return "[" + "▓" * current + "░" * (total - current) + f"] {current}/{total}"
+    filled = "▓" * current
+    empty  = "░" * (total - current)
+    return f"[{filled}{empty}] {current}/{total}"
 
 
 def last_hint(user_id: int, ex_name: str) -> str:
@@ -140,65 +135,159 @@ def last_hint(user_id: int, ex_name: str) -> str:
     return f"\n📖 _Прошлый раз: {sets_summary(last['sets_data'])}_"
 
 
+def bmi_info(weight: float, height: int) -> str:
+    if not weight or not height:
+        return ""
+    bmi = weight / ((height / 100) ** 2)
+    if bmi < 18.5:
+        cat = "недостаточный вес"
+    elif bmi < 25:
+        cat = "норма"
+    elif bmi < 30:
+        cat = "избыточный вес"
+    else:
+        cat = "ожирение"
+    return f"📊 ИМТ: *{bmi:.1f}* ({cat})"
+
+
+# ─── РЕГИСТРАЦИЯ ──────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Точка входа — проверяем регистрацию."""
+    user_id = update.effective_user.id
+    profile = db.get_profile(user_id)
+    if profile:
+        return await show_main_menu(update, context)
+    # Новый пользователь
+    name = update.effective_user.first_name or "Атлет"
+    await update.message.reply_text(
+        f"👋 Привет, *{name}*!\n\n"
+        "Добро пожаловать в *Workout Tracker*.\n"
+        "Давай заполним твой профиль.\n\n"
+        "Как тебя зовут? (или нажми /skip чтобы использовать имя из Telegram)",
+        parse_mode="Markdown",
+    )
+    context.user_data["reg_name"] = name
+    return REG_NAME
+
+
+async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["reg_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        "⚖️ Введи свой вес в кг (например: `75` или `75.5`):",
+        parse_mode="Markdown",
+    )
+    return REG_WEIGHT
+
+
+async def reg_skip_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚖️ Введи свой вес в кг (например: `75` или `75.5`):",
+        parse_mode="Markdown",
+    )
+    return REG_WEIGHT
+
+
+async def reg_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        w = float(text)
+        assert 20 < w < 300
+    except Exception:
+        await update.message.reply_text("⚠️ Введи корректный вес, например `75`:", parse_mode="Markdown")
+        return REG_WEIGHT
+    context.user_data["reg_weight"] = w
+    await update.message.reply_text(
+        "📏 Введи свой рост в см (например: `175`):",
+        parse_mode="Markdown",
+    )
+    return REG_HEIGHT
+
+
+async def reg_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        h = int(text)
+        assert 100 < h < 250
+    except Exception:
+        await update.message.reply_text("⚠️ Введи корректный рост, например `175`:", parse_mode="Markdown")
+        return REG_HEIGHT
+
+    user_id = update.effective_user.id
+    name    = context.user_data.get("reg_name", update.effective_user.first_name)
+    weight  = context.user_data["reg_weight"]
+
+    db.save_profile(user_id, name, weight, h)
+
+    bmi = bmi_info(weight, h)
+    await update.message.reply_text(
+        f"✅ *Профиль создан!*\n\n"
+        f"👤 Имя: *{name}*\n"
+        f"⚖️ Вес: *{weight} кг*\n"
+        f"📏 Рост: *{h} см*\n"
+        f"{bmi}\n\n"
+        "Теперь можешь начинать тренировки! 💪",
+        parse_mode="Markdown",
+    )
+    return await show_main_menu(update, context)
+
+
 # ─── ГЛАВНОЕ МЕНЮ ─────────────────────────────────────────────────────────────
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def main_menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏋️ Начать тренировку", callback_data="menu_train")],
         [
-            InlineKeyboardButton("🏋️ Добавить тренировку", callback_data="menu_train"),
+            InlineKeyboardButton("📋 История",    callback_data="menu_history"),
+            InlineKeyboardButton("📊 Статистика", callback_data="menu_stats"),
         ],
         [
-            InlineKeyboardButton("📋 История",     callback_data="menu_history"),
-            InlineKeyboardButton("📊 Статистика",  callback_data="menu_stats"),
+            InlineKeyboardButton("🏆 Рекорды",    callback_data="menu_records"),
+            InlineKeyboardButton("⚖️ Сравнить",   callback_data="menu_compare"),
         ],
-        [
-            InlineKeyboardButton("🏆 Рекорды",     callback_data="menu_records"),
-            InlineKeyboardButton("⚖️ Сравнить",    callback_data="menu_compare"),
-        ],
+        [InlineKeyboardButton("👤 Мой профиль",   callback_data="menu_profile")],
     ])
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db.ensure_user(user_id)
 
-    streak = db.get_streak(user_id)
-    total  = streak["total"]
-    cur_s  = streak["current"]
+    streak        = db.get_streak(user_id)
+    last_sessions = db.get_last_n_workouts(user_id, 1)
 
-    last_sessions = db.get_last_n_workouts(user_id, 2)
     last_line = ""
     if last_sessions:
-        s = last_sessions[0]
-        dt = datetime.fromisoformat(s["date"]).strftime("%d.%m.%Y")
+        s         = last_sessions[0]
+        dt        = datetime.fromisoformat(s["date"]).strftime("%d.%m.%Y")
         last_type = s["workout_type"]
         next_type = "B" if last_type == "A" else "A"
         last_line = (
             f"\n📅 Последняя: *Тренировка {last_type}* ({dt})"
-            f"\n💡 Рекомендуется сегодня: *Тренировка {next_type}*"
+            f"\n💡 Рекомендуется: *Тренировка {next_type}*"
         )
 
     streak_line = ""
-    if total > 0:
-        streak_line = f"\n🔥 Серия: *{cur_s}* тр.  |  Всего: *{total}* тр."
+    if streak["total"] > 0:
+        streak_line = f"\n🔥 Серия: *{streak['current']}*  |  Всего: *{streak['total']}* тр."
 
-    text = (
-        f"💪 *Workout Tracker*"
-        f"{last_line}"
-        f"{streak_line}\n\n"
-        f"Выбери действие:"
-    )
-    if update.message:
-        await update.message.reply_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+    text = f"💪 *Workout Tracker*{last_line}{streak_line}\n\nВыбери действие:"
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, reply_markup=main_menu_markup(), parse_mode="Markdown"
+        )
     else:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+        await update.message.reply_text(
+            text, reply_markup=main_menu_markup(), parse_mode="Markdown"
+        )
     return MAIN_MENU
 
 
 async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data
+    q = update.callback_query
+    await q.answer()
+    action = q.data
 
     if action == "menu_train":
         return await show_workout_choice(update, context)
@@ -210,20 +299,103 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await show_records(update, context)
     elif action == "menu_compare":
         return await compare_start(update, context)
+    elif action == "menu_profile":
+        return await show_profile(update, context)
     elif action == "back_main":
-        return await start(update, context)
+        return await show_main_menu(update, context)
+
+
+# ─── ПРОФИЛЬ ──────────────────────────────────────────────────────────────────
+
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q       = update.callback_query
+    user_id = q.from_user.id
+    p       = db.get_profile(user_id)
+
+    if not p:
+        await q.edit_message_text("Профиль не найден. Напиши /start")
+        return MAIN_MENU
+
+    bmi = bmi_info(p.get("weight"), p.get("height"))
+    text = (
+        f"👤 *Профиль*\n\n"
+        f"Имя: *{p.get('name', '—')}*\n"
+        f"⚖️ Вес: *{p.get('weight', '—')} кг*\n"
+        f"📏 Рост: *{p.get('height', '—')} см*\n"
+        f"{bmi}"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Изменить вес",  callback_data="profile_edit_weight"),
+            InlineKeyboardButton("✏️ Изменить рост", callback_data="profile_edit_height"),
+        ],
+        [InlineKeyboardButton("↩️ Назад", callback_data="back_main")],
+    ])
+    await q.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    return MAIN_MENU
+
+
+async def profile_edit_weight_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text("⚖️ Введи новый вес в кг (например: `78`):", parse_mode="Markdown")
+    return PROFILE_EDIT_WEIGHT
+
+
+async def profile_edit_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        w = float(text)
+        assert 20 < w < 300
+    except Exception:
+        await update.message.reply_text("⚠️ Некорректный вес. Попробуй ещё раз:", parse_mode="Markdown")
+        return PROFILE_EDIT_WEIGHT
+
+    user_id = update.effective_user.id
+    db.update_profile_weight(user_id, w)
+    await update.message.reply_text(f"✅ Вес обновлён: *{w} кг*", parse_mode="Markdown")
+    # Возвращаемся в главное меню через кнопку
+    await update.message.reply_text(
+        "Выбери действие:", reply_markup=main_menu_markup()
+    )
+    return MAIN_MENU
+
+
+async def profile_edit_height_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text("📏 Введи новый рост в см (например: `176`):", parse_mode="Markdown")
+    return PROFILE_EDIT_HEIGHT
+
+
+async def profile_edit_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        h = int(text)
+        assert 100 < h < 250
+    except Exception:
+        await update.message.reply_text("⚠️ Некорректный рост. Попробуй ещё раз:", parse_mode="Markdown")
+        return PROFILE_EDIT_HEIGHT
+
+    user_id = update.effective_user.id
+    db.update_profile_height(user_id, h)
+    await update.message.reply_text(f"✅ Рост обновлён: *{h} см*", parse_mode="Markdown")
+    await update.message.reply_text(
+        "Выбери действие:", reply_markup=main_menu_markup()
+    )
+    return MAIN_MENU
 
 
 # ─── ВЫБОР ТРЕНИРОВКИ ─────────────────────────────────────────────────────────
 
 async def show_workout_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
+    q       = update.callback_query
+    user_id = q.from_user.id
 
     last_sessions = db.get_last_n_workouts(user_id, 2)
 
     def session_block(s: dict, label: str) -> str:
-        dt = datetime.fromisoformat(s["date"]).strftime("%d.%m.%Y")
+        dt    = datetime.fromisoformat(s["date"]).strftime("%d.%m.%Y")
         lines = [f"*{label} — Тренировка {s['workout_type']}* ({dt})"]
         for ex in s["exercises"]:
             if ex.get("skipped"):
@@ -243,42 +415,40 @@ async def show_workout_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not preview:
         preview = "\n\n_Тренировок ещё не было. Самое время начать! 💪_"
 
-    keyboard = [
+    keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🅰️  Тренировка A", callback_data="workout_A"),
-            InlineKeyboardButton("🅱️  Тренировка B", callback_data="workout_B"),
+            InlineKeyboardButton("🅰️ Тренировка A", callback_data="workout_A"),
+            InlineKeyboardButton("🅱️ Тренировка B", callback_data="workout_B"),
         ],
         [InlineKeyboardButton("↩️ Назад", callback_data="back_main")],
-    ]
-    await query.edit_message_text(
+    ])
+    await q.edit_message_text(
         f"🏋️ *Выбери тренировку:*{preview}",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=keyboard,
         parse_mode="Markdown",
     )
     return CHOOSE_WORKOUT
 
 
-# ─── СТАРТ ТРЕНИРОВКИ ─────────────────────────────────────────────────────────
-
 async def choose_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    q = update.callback_query
+    await q.answer()
 
-    if query.data == "back_main":
-        return await start(update, context)
+    if q.data == "back_main":
+        return await show_main_menu(update, context)
 
-    workout_type = query.data.split("_")[1]
-    user_id = query.from_user.id
-    exercises = get_exercises(user_id, workout_type)
+    workout_type = q.data.split("_")[1]
+    user_id      = q.from_user.id
+    exercises    = get_exercises(user_id, workout_type)
 
     context.user_data.update({
-        "workout_type": workout_type,
-        "exercises": exercises,
-        "ex_idx": 0,
-        "set_idx": 0,
-        "results": [],
-        "current_sets": [],
-        "user_id": user_id,
+        "workout_type":  workout_type,
+        "exercises":     exercises,
+        "ex_idx":        0,
+        "set_idx":       0,
+        "results":       [],
+        "current_sets":  [],
+        "user_id":       user_id,
     })
 
     workout_name = WORKOUTS[workout_type]["name"]
@@ -286,38 +456,36 @@ async def choose_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  {i+1}. {ex['name']}  —  {ex['sets']}×{ex['reps']}"
         for i, ex in enumerate(exercises)
     )
-    await query.edit_message_text(
+    await q.edit_message_text(
         f"*{workout_name}* — {len(exercises)} упражнений\n\n{ex_list}\n\n▶️ Начинаем!",
         parse_mode="Markdown",
     )
-    await _ask_set(context, query.message.chat_id)
+    await _ask_set(context, q.message.chat_id)
     return ENTERING_SET
 
 
 # ─── ЦИКЛ ВВОДА ПОДХОДОВ ──────────────────────────────────────────────────────
 
 async def _ask_set(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    exercises = context.user_data["exercises"]
-    ex_idx    = context.user_data["ex_idx"]
-    set_idx   = context.user_data["set_idx"]
-    user_id   = context.user_data.get("user_id", 0)
-
-    ex          = exercises[ex_idx]
-    total_sets  = ex["sets"]
+    exercises    = context.user_data["exercises"]
+    ex_idx       = context.user_data["ex_idx"]
+    set_idx      = context.user_data["set_idx"]
+    user_id      = context.user_data.get("user_id", 0)
+    ex           = exercises[ex_idx]
+    total_sets   = ex["sets"]
     current_sets = context.user_data["current_sets"]
 
-    # Уже введённые подходы
     done_str = ""
     if current_sets:
-        lines = [f"  подход {i+1}: {fmt_set(w, r)}" for i, (w, r) in enumerate(current_sets)]
+        lines    = [f"  подход {i+1}: {fmt_set(w, r)}" for i, (w, r) in enumerate(current_sets)]
         done_str = "\n" + "\n".join(lines) + "\n"
 
     fmt_hint = ""
     if ex_idx == 0 and set_idx == 0:
         fmt_hint = (
-            "\n\n📝 *Формат:*\n"
+            "\n\n📝 *Формат ввода:*\n"
             "`60 10` — 60 кг, 10 повт.\n"
-            "`10` — только повторения (вес как в прошлом подходе)\n"
+            "`10` — только повт. (вес как в прошлом подходе)\n"
             "`без веса 15` — без отягощения"
         )
 
@@ -332,16 +500,25 @@ async def _ask_set(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     )
 
     keyboard = []
+
+    # Кнопка повтора прошлого подхода
     if current_sets:
         lw, lr = current_sets[-1]
         keyboard.append([
             InlineKeyboardButton(f"🔁 Повторить ({fmt_set(lw, lr)})", callback_data="repeat_set")
         ])
 
+    # Кнопка «как в прошлый раз» — только для первого подхода
     last_ex = db.get_last_exercise_result(user_id, ex["name"])
     if last_ex and last_ex.get("sets_data") and set_idx == 0 and not current_sets:
         keyboard.append([
             InlineKeyboardButton("📋 Как в прошлый раз (все подходы)", callback_data="copy_last")
+        ])
+
+    # Кнопка «завершить упражнение» — если уже есть хотя бы один подход
+    if current_sets:
+        keyboard.append([
+            InlineKeyboardButton("✅ Завершить упражнение", callback_data="finish_ex")
         ])
 
     keyboard.append([InlineKeyboardButton("⏭ Пропустить упражнение", callback_data="skip_ex")])
@@ -356,8 +533,8 @@ async def _ask_set(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 async def receive_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     context.user_data["user_id"] = user_id
-    text = update.message.text.strip()
-    parsed = parse_set_input(text)
+    text    = update.message.text.strip()
+    parsed  = parse_set_input(text)
 
     if parsed is None:
         await update.message.reply_text(
@@ -400,17 +577,18 @@ async def repeat_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def copy_last_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q       = update.callback_query
     await q.answer()
     user_id = q.from_user.id
-    ex = context.user_data["exercises"][context.user_data["ex_idx"]]
-    le = db.get_last_exercise_result(user_id, ex["name"])
+    ex      = context.user_data["exercises"][context.user_data["ex_idx"]]
+    le      = db.get_last_exercise_result(user_id, ex["name"])
     if not le or not le.get("sets_data"):
         await q.message.reply_text("Нет данных прошлой тренировки.")
         return ENTERING_SET
 
     context.user_data["results"].append({
-        "name": ex["name"], "sets_plan": f"{ex['sets']}×{ex['reps']}",
+        "name":      ex["name"],
+        "sets_plan": f"{ex['sets']}×{ex['reps']}",
         "sets_data": le["sets_data"],
     })
     await q.message.reply_text(
@@ -420,13 +598,34 @@ async def copy_last_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _next_exercise(context, q.message.chat_id)
 
 
+async def finish_ex_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Завершить упражнение досрочно (если хотят сделать больше или меньше подходов)."""
+    q  = update.callback_query
+    await q.answer()
+    ex         = context.user_data["exercises"][context.user_data["ex_idx"]]
+    sets_data  = list(context.user_data["current_sets"])
+    context.user_data["results"].append({
+        "name":      ex["name"],
+        "sets_plan": f"{ex['sets']}×{ex['reps']}",
+        "sets_data": sets_data,
+    })
+    await q.message.reply_text(
+        f"🏁 *{ex['name']}* — готово!\n{sets_summary(sets_data)}",
+        parse_mode="Markdown",
+    )
+    context.user_data["current_sets"] = []
+    return await _next_exercise(context, q.message.chat_id)
+
+
 async def skip_ex_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q  = update.callback_query
     await q.answer("Пропущено ⏭")
     ex = context.user_data["exercises"][context.user_data["ex_idx"]]
     context.user_data["results"].append({
-        "name": ex["name"], "sets_plan": f"{ex['sets']}×{ex['reps']}",
-        "sets_data": [], "skipped": True,
+        "name":      ex["name"],
+        "sets_plan": f"{ex['sets']}×{ex['reps']}",
+        "sets_data": [],
+        "skipped":   True,
     })
     await q.message.reply_text(f"⏭ *{ex['name']}* — пропущено.", parse_mode="Markdown")
     return await _next_exercise(context, q.message.chat_id)
@@ -434,24 +633,27 @@ async def skip_ex_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _record_set(context: ContextTypes.DEFAULT_TYPE, chat_id: int, w, r: int):
     context.user_data["current_sets"].append((w, r))
-    exercises   = context.user_data["exercises"]
-    ex_idx      = context.user_data["ex_idx"]
-    ex          = exercises[ex_idx]
-    set_num     = context.user_data["set_idx"] + 1
-    total_sets  = ex["sets"]
+    exercises  = context.user_data["exercises"]
+    ex_idx     = context.user_data["ex_idx"]
+    ex         = exercises[ex_idx]
+    set_num    = context.user_data["set_idx"] + 1
+    total_sets = ex["sets"]
 
     await context.bot.send_message(
         chat_id, f"✔️ Подход {set_num}: *{fmt_set(w, r)}*", parse_mode="Markdown"
     )
 
     if set_num >= total_sets:
+        # Все запланированные подходы выполнены
         sets_data = list(context.user_data["current_sets"])
         context.user_data["results"].append({
-            "name": ex["name"], "sets_plan": f"{ex['sets']}×{ex['reps']}",
+            "name":      ex["name"],
+            "sets_plan": f"{ex['sets']}×{ex['reps']}",
             "sets_data": sets_data,
         })
         await context.bot.send_message(
-            chat_id, f"🏁 *{ex['name']}* — готово!\n{sets_summary(sets_data)}",
+            chat_id,
+            f"🏁 *{ex['name']}* — готово!\n{sets_summary(sets_data)}",
             parse_mode="Markdown",
         )
         context.user_data["ex_idx"]      += 1
@@ -459,7 +661,7 @@ async def _record_set(context: ContextTypes.DEFAULT_TYPE, chat_id: int, w, r: in
         context.user_data["current_sets"] = []
 
         if context.user_data["ex_idx"] >= len(exercises):
-            await show_confirm_chat(context, chat_id)
+            await _show_confirm(context, chat_id)
         else:
             nxt = exercises[context.user_data["ex_idx"]]
             await context.bot.send_message(
@@ -480,12 +682,14 @@ async def _next_exercise(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     exercises = context.user_data["exercises"]
 
     if context.user_data["ex_idx"] >= len(exercises):
-        await show_confirm_chat(context, chat_id)
+        await _show_confirm(context, chat_id)
         return CONFIRM_RESULTS
 
     nxt = exercises[context.user_data["ex_idx"]]
     await context.bot.send_message(
-        chat_id, f"──────────────\n➡️ Следующее: *{nxt['name']}*", parse_mode="Markdown"
+        chat_id,
+        f"──────────────\n➡️ Следующее: *{nxt['name']}*",
+        parse_mode="Markdown",
     )
     await _ask_set(context, chat_id)
     return ENTERING_SET
@@ -513,17 +717,21 @@ def _summary_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     return "\n".join(lines)
 
 
-async def show_confirm_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    keyboard = [
-        [InlineKeyboardButton("✅ Сохранить", callback_data="save"),
-         InlineKeyboardButton("📝 Добавить заметку", callback_data="add_note")],
-        [InlineKeyboardButton("➕ Добавить упражнение", callback_data="add_exercise"),
-         InlineKeyboardButton("🗑 Управление списком",  callback_data="manage_exercises")],
-        [InlineKeyboardButton("🔄 Начать заново", callback_data="restart")],
-    ]
+async def _show_confirm(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Сохранить",        callback_data="save"),
+            InlineKeyboardButton("📝 Заметка",          callback_data="add_note"),
+        ],
+        [
+            InlineKeyboardButton("➕ Добавить упражнение", callback_data="add_exercise"),
+            InlineKeyboardButton("🗑 Управление",          callback_data="manage_exercises"),
+        ],
+        [InlineKeyboardButton("🔄 Начать заново",       callback_data="restart")],
+    ])
     await context.bot.send_message(
         chat_id, _summary_text(context),
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=keyboard,
         parse_mode="Markdown",
     )
 
@@ -531,20 +739,25 @@ async def show_confirm_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 async def save_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
+    logger.info(f"save_cb: user_data keys = {list(context.user_data.keys())}")
+
     user_id      = q.from_user.id
     workout_type = context.user_data.get("workout_type")
     results      = context.user_data.get("results", [])
     notes        = context.user_data.get("notes", "")
 
     if not workout_type or not results:
-        await q.message.reply_text("⚠️ Нет данных для сохранения. Начни тренировку заново: /start")
-        return ConversationHandler.END
+        await q.message.reply_text(
+            "⚠️ Нет данных для сохранения. Начни тренировку заново.",
+            reply_markup=main_menu_markup(),
+        )
+        return MAIN_MENU
 
     db.save_workout_session(user_id, workout_type, results, notes=notes)
 
     total_sets = sum(len(r["sets_data"]) for r in results)
-    # Защита: пропускаем упражнения без данных
-    total_reps = sum(r for ex in results for _, r in ex.get("sets_data", []))
+    total_reps = sum(rep for ex in results for _, rep in ex.get("sets_data", []))
     vol        = session_volume(results)
     streak     = db.get_streak(user_id)
 
@@ -558,44 +771,50 @@ async def save_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"🔥 Серия: *{streak['current']}* тренировок\n\n"
     if notes:
         text += f"📝 _{notes}_\n\n"
-    text += "Отличная работа! 💪\n\nНажми /start для следующей тренировки."
+    text += "Отличная работа! 💪"
 
-    await q.edit_message_text(text, parse_mode="Markdown")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")]
+    ])
+    await q.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
     context.user_data.clear()
-    return ConversationHandler.END
+    return MAIN_MENU
 
 
 async def restart_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q        = update.callback_query
     await q.answer()
-    user_id      = q.from_user.id
-    workout_type = context.user_data["workout_type"]
+    user_id  = q.from_user.id
+    wt       = context.user_data["workout_type"]
     context.user_data.update({
-        "exercises": get_exercises(user_id, workout_type),
-        "ex_idx": 0, "set_idx": 0,
-        "results": [], "current_sets": [], "user_id": user_id,
+        "exercises":    get_exercises(user_id, wt),
+        "ex_idx":       0,
+        "set_idx":      0,
+        "results":      [],
+        "current_sets": [],
+        "user_id":      user_id,
     })
     await q.edit_message_text("🔄 Начинаем заново!")
     await _ask_set(context, q.message.chat_id)
     return ENTERING_SET
 
 
-# ─── ЗАМЕТКА К ТРЕНИРОВКЕ ────────────────────────────────────────────────────
+# ─── ЗАМЕТКА ──────────────────────────────────────────────────────────────────
 
 async def add_note_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.message.reply_text(
-        "📝 Введи заметку к тренировке (самочувствие, наблюдения и т.д.):"
-    )
+    await q.message.reply_text("📝 Введи заметку к тренировке:")
     return ADD_NOTE
 
 
 async def receive_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["notes"] = update.message.text.strip()
-    await update.message.reply_text(f"📝 Заметка сохранена: _{context.user_data['notes']}_",
-                                    parse_mode="Markdown")
-    await show_confirm_chat(context, update.effective_chat.id)
+    await update.message.reply_text(
+        f"📝 Заметка сохранена: _{context.user_data['notes']}_",
+        parse_mode="Markdown",
+    )
+    await _show_confirm(context, update.effective_chat.id)
     return CONFIRM_RESULTS
 
 
@@ -635,17 +854,17 @@ async def add_ex_reps(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["exercises"].append({"name": name, "sets": sets, "reps": reps})
 
     await update.message.reply_text(
-        f"✅ *{name}* добавлено ({sets}×{reps}). Сохранено навсегда.",
+        f"✅ *{name}* добавлено ({sets}×{reps}).",
         parse_mode="Markdown",
     )
-    await show_confirm_chat(context, update.effective_chat.id)
+    await _show_confirm(context, update.effective_chat.id)
     return CONFIRM_RESULTS
 
 
 # ─── УПРАВЛЕНИЕ УПРАЖНЕНИЯМИ ──────────────────────────────────────────────────
 
 async def manage_exercises_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q            = update.callback_query
     await q.answer()
     exercises    = context.user_data["exercises"]
     user_id      = q.from_user.id
@@ -663,8 +882,7 @@ async def manage_exercises_menu(update: Update, context: ContextTypes.DEFAULT_TY
 
     keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back_confirm")])
     await q.message.reply_text(
-        "🗑 Нажми чтобы *убрать* упражнение из тренировки навсегда.\n"
-        "♻️ *Вернуть* — восстановить удалённое.",
+        "🗑 Нажми чтобы *убрать* упражнение.\n♻️ *Вернуть* — восстановить удалённое.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -672,7 +890,7 @@ async def manage_exercises_menu(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def do_remove_exercise(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q            = update.callback_query
     await q.answer()
     idx          = int(q.data.split("_")[1])
     user_id      = q.from_user.id
@@ -682,7 +900,9 @@ async def do_remove_exercise(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if idx < len(exercises):
         name = exercises[idx]["name"]
         exercises.pop(idx)
-        context.user_data["results"] = [r for r in context.user_data["results"] if r["name"] != name]
+        context.user_data["results"] = [
+            r for r in context.user_data["results"] if r["name"] != name
+        ]
         base_names = [e["name"] for e in WORKOUTS[workout_type]["exercises"]]
         if name in base_names:
             db.remove_exercise(user_id, workout_type, name)
@@ -690,12 +910,12 @@ async def do_remove_exercise(update: Update, context: ContextTypes.DEFAULT_TYPE)
             db.remove_custom_exercise(user_id, workout_type, name)
         await q.edit_message_text(f"🗑 *{name}* убрано.", parse_mode="Markdown")
 
-    await show_confirm_chat(context, q.message.chat_id)
+    await _show_confirm(context, q.message.chat_id)
     return CONFIRM_RESULTS
 
 
 async def restore_exercise_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q            = update.callback_query
     await q.answer()
     name         = q.data[len("rstore_"):]
     user_id      = q.from_user.id
@@ -705,21 +925,21 @@ async def restore_exercise_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     if base_ex:
         context.user_data["exercises"].append(base_ex.copy())
     await q.edit_message_text(f"♻️ *{name}* возвращено!", parse_mode="Markdown")
-    await show_confirm_chat(context, q.message.chat_id)
+    await _show_confirm(context, q.message.chat_id)
     return CONFIRM_RESULTS
 
 
 async def back_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await show_confirm_chat(context, q.message.chat_id)
+    await _show_confirm(context, q.message.chat_id)
     return CONFIRM_RESULTS
 
 
 # ─── ИСТОРИЯ ──────────────────────────────────────────────────────────────────
 
 async def show_history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q       = update.callback_query
     user_id = q.from_user.id
     sessions = db.get_history(user_id, limit=10)
 
@@ -741,7 +961,7 @@ async def show_history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back_main")])
     await q.edit_message_text(
-        "📋 *История тренировок:*\nНажми на дату для подробностей.",
+        "📋 *История тренировок:*\nНажми для подробностей.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -749,7 +969,7 @@ async def show_history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def view_session_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q          = update.callback_query
     await q.answer()
     session_id = int(q.data.split("_")[-1])
     user_id    = q.from_user.id
@@ -759,8 +979,8 @@ async def view_session_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Тренировка не найдена.")
         return MAIN_MENU
 
-    dt   = datetime.fromisoformat(s["date"]).strftime("%d.%m.%Y %H:%M")
-    vol  = session_volume(s["exercises"])
+    dt    = datetime.fromisoformat(s["date"]).strftime("%d.%m.%Y %H:%M")
+    vol   = session_volume(s["exercises"])
     lines = [f"*Тренировка {s['workout_type']} — {dt}*\n"]
 
     for ex in s["exercises"]:
@@ -776,43 +996,40 @@ async def view_session_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if s.get("notes"):
         lines.append(f"📝 _{s['notes']}_")
 
-    keyboard = [
-        [InlineKeyboardButton("🗑 Удалить тренировку", callback_data=f"del_session_{session_id}")],
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f"del_session_{session_id}")],
         [InlineKeyboardButton("↩️ К списку", callback_data="menu_history")],
-    ]
+    ])
     await q.edit_message_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
+        "\n".join(lines), reply_markup=keyboard, parse_mode="Markdown"
     )
     return MAIN_MENU
 
 
 async def delete_session_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q          = update.callback_query
     await q.answer()
     session_id = int(q.data.split("_")[-1])
-    user_id    = q.from_user.id
 
-    keyboard = [
+    keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_del_{session_id}"),
-            InlineKeyboardButton("❌ Нет", callback_data="menu_history"),
+            InlineKeyboardButton("❌ Нет",         callback_data="menu_history"),
         ]
-    ]
+    ])
     await q.edit_message_text(
         "⚠️ Удалить эту тренировку? Это действие нельзя отменить.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=keyboard,
     )
     return MAIN_MENU
 
 
 async def confirm_delete_session_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q          = update.callback_query
     await q.answer()
     session_id = int(q.data.split("_")[-1])
     user_id    = q.from_user.id
-    ok = db.delete_session(user_id, session_id)
+    ok         = db.delete_session(user_id, session_id)
 
     msg = "✅ Тренировка удалена." if ok else "⚠️ Не удалось удалить."
     await q.edit_message_text(
@@ -825,49 +1042,45 @@ async def confirm_delete_session_cb(update: Update, context: ContextTypes.DEFAUL
 # ─── СТАТИСТИКА ───────────────────────────────────────────────────────────────
 
 async def show_stats_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q       = update.callback_query
     user_id = q.from_user.id
 
     streak  = db.get_streak(user_id)
     weekly  = db.get_weekly_summary(user_id, weeks=4)
     volumes = db.get_volume_per_session(user_id, limit=5)
 
-    # Еженедельные тренировки текстовым баром
     week_lines = []
     for w in weekly:
         bar = "█" * w["count"] + "░" * max(0, 4 - w["count"])
         week_lines.append(f"  {w['week']}: {bar} {w['count']}")
 
-    # Объём последних тренировок
     vol_lines = []
     for v in volumes:
-        dt = datetime.fromisoformat(v["date"]).strftime("%d.%m")
+        dt  = datetime.fromisoformat(v["date"]).strftime("%d.%m")
         bar = "▓" * min(10, int(v["volume"] / 2000)) if v["volume"] else "░"
         vol_lines.append(f"  [{v['type']}] {dt}: {v['volume']:,.0f} кг  {bar}")
 
     text = (
         f"📊 *Статистика*\n\n"
-        f"🔥 Серия: *{streak['current']}* тренировок подряд\n"
+        f"🔥 Серия: *{streak['current']}* подряд\n"
         f"🏆 Лучшая серия: *{streak['best']}*\n"
         f"📅 Всего тренировок: *{streak['total']}*\n\n"
         f"*Активность по неделям:*\n" + "\n".join(week_lines) + "\n\n"
         f"*Объём последних тренировок:*\n" + ("\n".join(vol_lines) or "  Нет данных")
     )
 
-    keyboard = [
+    keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📈 Прогресс по упражнению", callback_data="stats_exercise")],
         [InlineKeyboardButton("↩️ Назад", callback_data="back_main")],
-    ]
-    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    ])
+    await q.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
     return MAIN_MENU
 
 
 async def stats_exercise_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    q        = update.callback_query
     await q.answer()
-
-    # Собрать все упражнения из истории
-    user_id = q.from_user.id
+    user_id  = q.from_user.id
     sessions = db.get_history(user_id, limit=30)
     all_names = []
     seen = set()
@@ -910,7 +1123,7 @@ async def stats_exercise_show(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not history:
         await q.edit_message_text(
-            f"Нет данных по упражнению *{ex_name}*.",
+            f"Нет данных по *{ex_name}*.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Назад", callback_data="menu_stats")]]),
             parse_mode="Markdown",
         )
@@ -922,17 +1135,14 @@ async def stats_exercise_show(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append(f"🏆 Рекорд: *{pr['weight']} кг* ({pr_dt})\n")
 
     for entry in reversed(history):
-        dt  = datetime.fromisoformat(entry["date"]).strftime("%d.%m")
+        dt    = datetime.fromisoformat(entry["date"]).strftime("%d.%m")
         max_w = max((w for w, r in entry["sets_data"] if isinstance(w, (int, float))), default=None)
         bar   = "▓" * min(10, int(max_w / 10)) if max_w else "░"
         lines.append(f"  {dt}: {sets_summary(entry['sets_data'])} {bar}")
 
-    keyboard = [
-        [InlineKeyboardButton("↩️ Назад", callback_data="menu_stats")],
-    ]
     await q.edit_message_text(
         "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Назад", callback_data="menu_stats")]]),
         parse_mode="Markdown",
     )
     return MAIN_MENU
@@ -941,11 +1151,10 @@ async def stats_exercise_show(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ─── РЕКОРДЫ ──────────────────────────────────────────────────────────────────
 
 async def show_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    user_id = q.from_user.id
+    q        = update.callback_query
+    user_id  = q.from_user.id
     sessions = db.get_history(user_id, limit=50)
 
-    # Собираем все имена упражнений
     all_names = set()
     for s in sessions:
         for ex in s["exercises"]:
@@ -967,20 +1176,19 @@ async def show_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dt = datetime.fromisoformat(pr["date"]).strftime("%d.%m.%Y")
             lines.append(f"  *{name}*: {pr['weight']} кг ({dt})")
 
-    keyboard = [[InlineKeyboardButton("↩️ Назад", callback_data="back_main")]]
     await q.edit_message_text(
         "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Назад", callback_data="back_main")]]),
         parse_mode="Markdown",
     )
     return MAIN_MENU
 
 
-# ─── СРАВНЕНИЕ ТРЕНИРОВОК ─────────────────────────────────────────────────────
+# ─── СРАВНЕНИЕ ────────────────────────────────────────────────────────────────
 
 async def compare_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    user_id = q.from_user.id
+    q        = update.callback_query
+    user_id  = q.from_user.id
     sessions = db.get_history(user_id, limit=10)
 
     if len(sessions) < 2:
@@ -999,7 +1207,7 @@ async def compare_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back_main")])
 
     await q.edit_message_text(
-        "⚖️ *Сравнение тренировок*\n\nВыбери *первую* тренировку:",
+        "⚖️ *Сравнение*\n\nВыбери *первую* тренировку:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -1011,12 +1219,12 @@ async def compare_pick_first(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await q.answer()
 
     if q.data == "back_main":
-        return await start(update, context)
+        return await show_main_menu(update, context)
 
-    session_id = int(q.data.split("_")[1])
+    session_id                  = int(q.data.split("_")[1])
     context.user_data["cmp_s1"] = session_id
-    user_id = q.from_user.id
-    sessions = db.get_history(user_id, limit=10)
+    user_id                     = q.from_user.id
+    sessions                    = db.get_history(user_id, limit=10)
 
     keyboard = []
     for s in sessions:
@@ -1040,7 +1248,7 @@ async def compare_pick_second(update: Update, context: ContextTypes.DEFAULT_TYPE
     await q.answer()
 
     if q.data == "back_main":
-        return await start(update, context)
+        return await show_main_menu(update, context)
 
     sid2    = int(q.data.split("_")[1])
     sid1    = context.user_data["cmp_s1"]
@@ -1059,99 +1267,106 @@ async def compare_pick_second(update: Update, context: ContextTypes.DEFAULT_TYPE
     diff   = v1 - v2
     sign   = "+" if diff >= 0 else ""
 
-    # Общие упражнения
-    map1 = {ex["name"]: ex for ex in s1["exercises"] if ex.get("sets_data")}
-    map2 = {ex["name"]: ex for ex in s2["exercises"] if ex.get("sets_data")}
+    map1   = {ex["name"]: ex for ex in s1["exercises"] if ex.get("sets_data")}
+    map2   = {ex["name"]: ex for ex in s2["exercises"] if ex.get("sets_data")}
     common = set(map1) & set(map2)
 
     lines = [
-        f"⚖️ *Сравнение:*\n",
+        "⚖️ *Сравнение:*\n",
         f"  🔵 {dt1} — Тренировка {s1['workout_type']}: *{v1:,.0f} кг*",
         f"  🟠 {dt2} — Тренировка {s2['workout_type']}: *{v2:,.0f} кг*",
-        f"  Разница объёма: *{sign}{diff:,.0f} кг*\n",
+        f"  Разница: *{sign}{diff:,.0f} кг*\n",
     ]
 
     if common:
-        lines.append("*Сравнение по упражнениям:*")
+        lines.append("*По упражнениям:*")
         for name in sorted(common):
-            e1 = map1[name]
-            e2 = map2[name]
+            e1  = map1[name]
+            e2  = map2[name]
             mw1 = max((w for w, r in e1["sets_data"] if isinstance(w, (int, float))), default=None)
             mw2 = max((w for w, r in e2["sets_data"] if isinstance(w, (int, float))), default=None)
             if mw1 is not None and mw2 is not None:
-                d = mw1 - mw2
+                d     = mw1 - mw2
                 sign2 = "+" if d >= 0 else ""
                 icon  = "📈" if d > 0 else ("📉" if d < 0 else "➡️")
                 lines.append(f"  {icon} *{name}*: {mw2}→{mw1} кг ({sign2}{d})")
 
-    keyboard = [[InlineKeyboardButton("↩️ Назад", callback_data="back_main")]]
     await q.edit_message_text(
         "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Назад", callback_data="back_main")]]),
         parse_mode="Markdown",
     )
     return MAIN_MENU
 
 
-# ─── /history /stats /records команды ────────────────────────────────────────
-
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = update.effective_user.id
-    sessions = db.get_history(user_id, limit=5)
-    if not sessions:
-        await update.message.reply_text("📋 История пуста. Начни тренировку! /start")
-        return
-    text = "📋 *Последние тренировки:*\n\n"
-    for s in sessions:
-        dt  = datetime.fromisoformat(s["date"]).strftime("%d.%m.%Y %H:%M")
-        vol = session_volume(s["exercises"])
-        text += f"*Тренировка {s['workout_type']} — {dt}*"
-        if vol:
-            text += f"  📦{vol:,.0f}кг"
-        text += "\n"
-        for ex in s["exercises"]:
-            if ex.get("skipped"):
-                text += f"  ⏭ {ex['name']}\n"
-            elif ex.get("sets_data"):
-                text += f"  ✅ {ex['name']}: {sets_summary(ex['sets_data'])}\n"
-        text += "\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
+# ─── CANCEL ───────────────────────────────────────────────────────────────────
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
-        "❌ Отменено. Данные не сохранены.\n/start — начать заново."
+        "❌ Отменено.\n\nВыбери действие:",
+        reply_markup=main_menu_markup(),
     )
-    return ConversationHandler.END
+    return MAIN_MENU
 
 
-# ─── main ─────────────────────────────────────────────────────────────────────
+# ─── ERROR HANDLER ────────────────────────────────────────────────────────────
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Ошибка:", exc_info=context.error)
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
     token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise ValueError("Укажи BOT_TOKEN в переменных окружения")
+
     app = Application.builder().token(token).build()
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[CommandHandler("start", cmd_start)],
         states={
-            MAIN_MENU: [
-                CallbackQueryHandler(main_menu_handler,        pattern="^(menu_|back_main)"),
-                CallbackQueryHandler(view_session_cb,          pattern="^view_session_"),
-                CallbackQueryHandler(delete_session_cb,        pattern="^del_session_"),
-                CallbackQueryHandler(confirm_delete_session_cb,pattern="^confirm_del_"),
-                CallbackQueryHandler(stats_exercise_prompt,    pattern="^stats_exercise$"),
-                CallbackQueryHandler(stats_exercise_show,      pattern="^(exstat_|menu_stats)"),
+            # Регистрация
+            REG_NAME:   [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name),
+                CommandHandler("skip", reg_skip_name),
             ],
+            REG_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_weight)],
+            REG_HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_height)],
+
+            # Главное меню
+            MAIN_MENU: [
+                CallbackQueryHandler(main_menu_handler,          pattern="^(menu_|back_main)"),
+                CallbackQueryHandler(view_session_cb,            pattern="^view_session_"),
+                CallbackQueryHandler(delete_session_cb,          pattern="^del_session_"),
+                CallbackQueryHandler(confirm_delete_session_cb,  pattern="^confirm_del_"),
+                CallbackQueryHandler(stats_exercise_prompt,      pattern="^stats_exercise$"),
+                CallbackQueryHandler(stats_exercise_show,        pattern="^(exstat_|menu_stats)"),
+                CallbackQueryHandler(profile_edit_weight_prompt, pattern="^profile_edit_weight$"),
+                CallbackQueryHandler(profile_edit_height_prompt, pattern="^profile_edit_height$"),
+            ],
+
+            # Профиль — редактирование
+            PROFILE_EDIT_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_edit_weight)],
+            PROFILE_EDIT_HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_edit_height)],
+
+            # Выбор тренировки
             CHOOSE_WORKOUT: [
                 CallbackQueryHandler(choose_workout, pattern="^(workout_|back_main)"),
             ],
+
+            # Ввод подходов
             ENTERING_SET: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_set),
                 CallbackQueryHandler(repeat_set_cb, pattern="^repeat_set$"),
                 CallbackQueryHandler(copy_last_cb,  pattern="^copy_last$"),
+                CallbackQueryHandler(finish_ex_cb,  pattern="^finish_ex$"),
                 CallbackQueryHandler(skip_ex_cb,    pattern="^skip_ex$"),
             ],
+
+            # Итоговый экран
             CONFIRM_RESULTS: [
                 CallbackQueryHandler(save_cb,               pattern="^save$"),
                 CallbackQueryHandler(restart_cb,            pattern="^restart$"),
@@ -1159,24 +1374,35 @@ def main():
                 CallbackQueryHandler(add_exercise_prompt,   pattern="^add_exercise$"),
                 CallbackQueryHandler(manage_exercises_menu, pattern="^manage_exercises$"),
                 CallbackQueryHandler(back_confirm_cb,       pattern="^back_confirm$"),
+                CallbackQueryHandler(main_menu_handler,     pattern="^back_main$"),
             ],
+
+            # Добавление упражнения
             ADD_EX_NAME:       [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ex_name)],
             ADD_EX_SETS_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ex_sets_count)],
             ADD_EX_REPS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ex_reps)],
+
+            # Управление упражнениями
             MANAGE_EXERCISES: [
-                CallbackQueryHandler(do_remove_exercise,   pattern="^rmex_\\d+$"),
-                CallbackQueryHandler(restore_exercise_cb,  pattern="^rstore_"),
-                CallbackQueryHandler(back_confirm_cb,      pattern="^back_confirm$"),
+                CallbackQueryHandler(do_remove_exercise,  pattern="^rmex_\\d+$"),
+                CallbackQueryHandler(restore_exercise_cb, pattern="^rstore_"),
+                CallbackQueryHandler(back_confirm_cb,     pattern="^back_confirm$"),
             ],
+
+            # Заметка
             ADD_NOTE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_note),
             ],
+
+            # Сравнение
             COMPARE_PICK_FIRST: [
                 CallbackQueryHandler(compare_pick_first, pattern="^(cmp1_|back_main)"),
             ],
             COMPARE_PICK_SECOND: [
                 CallbackQueryHandler(compare_pick_second, pattern="^(cmp2_|back_main)"),
             ],
+
+            # Статистика по упражнению
             STATS_EXERCISE: [
                 CallbackQueryHandler(stats_exercise_show, pattern="^(exstat_|menu_stats)"),
             ],
@@ -1186,14 +1412,17 @@ def main():
         per_message=False,
     )
 
-    async def get_db(update, context):
-        await update.message.reply_document(open("workouts.db", "rb"))
+    async def get_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            await update.message.reply_document(open("workouts.db", "rb"))
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка: {e}")
 
-    app.add_handler(conv)  # conv ПЕРВЫМ, до всего остального
+    app.add_handler(conv)
     app.add_handler(CommandHandler("getdb", get_db))
-    app.add_handler(CommandHandler("history", history_command))
+    app.add_error_handler(error_handler)
 
-    print("🤖 Бот запущен! Ctrl+C для остановки.")
+    print("🤖 Бот запущен!")
     app.run_polling(drop_pending_updates=True)
 
 
