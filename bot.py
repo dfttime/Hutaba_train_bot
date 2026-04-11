@@ -1194,7 +1194,7 @@ def main():
     app.add_handler(CommandHandler("history", history_command))
 
     print("🤖 Бот запущен! Ctrl+C для остановки.")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True)  # только один раз, в самом конце!
 
 
 if __name__ == "__main__":
